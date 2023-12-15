@@ -22,16 +22,24 @@ impl<T> PtrExt for NonNull<T> {
     }
 }
 
-pub fn cell_u64_ne_i32(v: &Cell<u64>) -> &[Cell<i32>; 2] {
+pub fn cell_u32_to_i32(v: &Cell<u32>) -> &Cell<i32> {
+    unsafe { transmute(v) }
+}
+
+pub fn cell_u64_ne_u32(v: &Cell<u64>) -> &[Cell<u32>; 2] {
     unsafe { transmute(v) }
 }
 
 #[cfg(target_endian = "little")]
-pub fn cell_u64_ms_i32(v: &Cell<u64>) -> &Cell<i32> {
-    &cell_u64_ne_i32(v)[1]
+pub fn cell_u64_ms_u32(v: &Cell<u64>) -> &Cell<u32> {
+    &cell_u64_ne_u32(v)[1]
 }
 
 #[cfg(target_endian = "big")]
+pub fn cell_u64_ms_u32(v: &Cell<u64>) -> &Cell<u32> {
+    &cell_u64_ne_u32(v)[0]
+}
+
 pub fn cell_u64_ms_i32(v: &Cell<u64>) -> &Cell<i32> {
-    &cell_u64_ne_i32(v)[0]
+	cell_u32_to_i32(cell_u64_ms_u32(v))
 }

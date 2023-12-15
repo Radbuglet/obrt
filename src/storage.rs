@@ -12,7 +12,7 @@ use derive_where::derive_where;
 
 use crate::{
     token::AcquireExclusiveFor,
-    util::{cell_u64_ms_i32, PtrExt},
+    util::{cell_u64_ms_i32, cell_u64_ms_u32, PtrExt},
 };
 
 // === Storage === //
@@ -52,7 +52,7 @@ struct Slot<T> {
     //   instead of zero.
     // - The last 32 bits indicate the borrow state (as an i32) if the slot is alive, or the
     //   byte-offset of the next allocation in the free list (as a u32) if the slot is zero. If
-    //   there is no next slot in the linked list, this value will be `u32::MAX`.
+    //   there is no next slot in the linked list, this value will be `StorageViewMut::<T>::SLOT_SENTINEL`.
     //
     // Borrow state format:
     //
@@ -124,8 +124,21 @@ impl<'a, T> AcquireExclusiveFor<'a> for Storage<T> {
 
 // ViewMut
 impl<'a, T: 'a> StorageViewMut<'a, T> {
+    // The size of Slot<T> in bytes.
     const SLOT_SIZE: usize = size_of::<Slot<T>>();
+
+    // The maximum number of slots we can put in a block and still have all the slots be addressable.
     const MAX_COUNT: u16 = (u16::MAX as usize / Self::SLOT_SIZE) as u16;
+
+    // A sentinel value for a slot which is guaranteed to never be a valid offset.
+    const SLOT_SENTINEL: u16 = {
+        if u16::MAX as usize % Self::SLOT_SIZE == 0 {
+            // A slot is at least 8 bytes in size so this is guaranteed to not be a valid offset.
+            u16::MAX - 1
+        } else {
+            u16::MAX
+        }
+    };
 
     pub fn alloc(self, value: T) -> Obj<T> {
         let inner = unsafe { &mut *self.inner.0.get() };
@@ -135,26 +148,29 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
             Self::expand_capacity(inner);
         }
 
-        // Fetch the next slot in the block.
+        // Fetch the hammered block.
         let block_idx = inner.hammered;
 
-        debug_assert_eq!(inner.block_ptrs.len(), inner.block_states.len());
-        debug_assert_ne!(block_idx, u16::MAX);
-        debug_assert!((block_idx as usize) < inner.block_states.len());
+        debug_assert_eq!(inner.block_ptrs.len(), inner.block_states.len()); // size invariant met?
+        debug_assert_ne!(block_idx, u16::MAX); // block actually initialized?
+        debug_assert!((block_idx as usize) < inner.block_states.len()); // index is valid?
 
         let block_ptr = *unsafe { inner.block_ptrs.get_unchecked(block_idx as usize) };
         let block_state = unsafe { inner.block_states.get_unchecked_mut(block_idx as usize) };
+
+        // Fetch the slot in the block.
         let slot_offset = block_state.free_list_head;
         debug_assert!(Self::is_valid_slot_offset(block_idx, slot_offset));
 
         let slot = unsafe { block_ptr.add_addr(slot_offset as usize).as_ref() };
 
         // Pop the slot from the free list.
-        let next_slot = (slot.state.get() >> 32) as u16;
+        let next_slot = cell_u64_ms_u32(&slot.state).get() as u16;
         block_state.free_list_head = next_slot;
         block_state.non_free_count += 1;
 
-        if next_slot == u16::MAX {
+        // If the slot is now empty, move on to the next hammered block.
+        if next_slot == Self::SLOT_SENTINEL {
             inner.hammered = block_state.next_hammered;
         } else {
             debug_assert!(Self::is_valid_slot_offset(block_idx, next_slot));
@@ -218,8 +234,8 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     fn is_valid_slot_offset(block: u16, offset: u16) -> bool {
-        offset as usize % Self::SLOT_SIZE == 0
-            && offset < Self::block_len(block) * Self::SLOT_SIZE as u16
+        offset as usize % Self::SLOT_SIZE == 0  // aligned? (and not sentinel)
+            && offset < Self::block_len(block) * Self::SLOT_SIZE as u16 // in bounds?
     }
 
     fn block_len(idx: u16) -> u16 {
@@ -289,5 +305,71 @@ impl<T> DerefMut for ObjRefMut<'_, T> {
 impl<T> Drop for ObjRefMut<'_, T> {
     fn drop(&mut self) {
         self.state.set(self.state.get() - 1);
+    }
+}
+
+// === Tests === //
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn linked_list_traversal_works() {
+        struct Item {
+            next: Option<Obj<Self>>,
+            value: u64,
+        }
+
+        let mut storage = Storage::<Item>::new();
+        let storage = storage.borrow_exclusive_mut();
+        let items = (0..100_000)
+            .map(|i| {
+                storage.alloc(Item {
+                    next: None,
+                    value: i,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (start, targets) = generate_permuted_chain(100_000);
+
+        for (src, target) in targets.into_iter().enumerate() {
+            if target != usize::MAX {
+                storage.get_mut(items[src]).next = Some(items[target]);
+            }
+        }
+
+        let start = items[start];
+
+        let mut cursor = Some(start);
+        let mut accum = 0;
+
+        while let Some(curr) = cursor {
+            let curr = storage.get_mut(curr);
+            accum += (*curr).value;
+            cursor = curr.next;
+        }
+
+        assert_eq!(4999950000, accum);
+    }
+
+    fn generate_permuted_chain(n: usize) -> (usize, Vec<usize>) {
+        fastrand::seed(4);
+
+        let mut remaining = (0..n).collect::<Vec<_>>();
+        let mut chain = (0..n).map(|_| usize::MAX).collect::<Vec<_>>();
+
+        let start = remaining.swap_remove(fastrand::usize(0..remaining.len()));
+        let mut cursor = start;
+
+        while !remaining.is_empty() {
+            let target = remaining.swap_remove(fastrand::usize(0..remaining.len()));
+
+            chain[cursor] = target;
+            cursor = target;
+        }
+
+        (start, chain)
     }
 }

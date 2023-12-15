@@ -56,17 +56,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "327762f6e5a765692301e5bb513e0d9fef63be86bbc14528052b1cd3e6f03e07"
 
 [[package]]
-name = "bort"
-version = "0.1.0"
-dependencies = [
- "autoken",
- "beap",
- "criterion",
- "derive-where",
- "fastrand",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,6 +325,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39e3200413f237f41ab11ad6d161bc7239c84dcb631773ccd7de3dfe4b5c267c"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "obrt"
+version = "0.1.0"
+dependencies = [
+ "autoken",
+ "beap",
+ "criterion",
+ "derive-where",
+ "fastrand",
 ]
 
 [[package]]

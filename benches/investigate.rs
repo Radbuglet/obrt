@@ -5,11 +5,11 @@ use std::{
     time::Duration,
 };
 
-use bort::{
+use criterion::{criterion_main, Criterion};
+use obrt::{
     storage::{Obj, Storage},
     token::AcquireExclusiveFor,
 };
-use criterion::{criterion_main, Criterion};
 
 criterion_main!(bench);
 
