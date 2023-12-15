@@ -10,7 +10,10 @@ use std::{
 
 use derive_where::derive_where;
 
-use crate::{token::AcquireExclusiveFor, util::PtrExt};
+use crate::{
+    token::AcquireExclusiveFor,
+    util::{cell_u64_ms_i32, PtrExt},
+};
 
 // === Storage === //
 
@@ -42,19 +45,20 @@ struct BlockState {
 }
 
 struct Slot<T> {
-    // This is secretly two u32s in disguise. From LSB to MSB...
+    // This is secretly two 32 bit numbers in disguise. From LSB to MSB...
     //
     // - The first 32 bits indicate the generation. When the slot is dead, this is set to the
     //   generation of the next object to take its place. As such, this value is initialized to one
     //   instead of zero.
-    // - The last 32 bits indicate the borrow state if the slot is alive, or the byte-offset
-    //   of the next allocation in the free list if the slot is zero. If there is no next slot
-    //   in the linked list, this value will be `u32::MAX`.
+    // - The last 32 bits indicate the borrow state (as an i32) if the slot is alive, or the
+    //   byte-offset of the next allocation in the free list (as a u32) if the slot is zero. If
+    //   there is no next slot in the linked list, this value will be `u32::MAX`.
     //
     // Borrow state format:
     //
     // - 0 means unborrowed
-    // - TODO
+    // - positive means mutably borrowed
+    // - negative means immutably borrowed
     //
     state: Cell<u64>,
     value: UnsafeCell<MaybeUninit<T>>,
@@ -160,7 +164,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let slot_state = slot.state.get();
         let generation = slot_state as u32;
 
-        debug_assert_eq!(generation, 0);
+        debug_assert_ne!(generation, 0);
         slot.state.set(generation as u64);
 
         let generation = unsafe { NonZeroU32::new_unchecked(generation) };
@@ -232,7 +236,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     #[inline]
-    pub fn get_mut(self, obj: Obj<T>) -> ObjMut<'a, T> {
+    pub fn get_mut(self, obj: Obj<T>) -> ObjRefMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         let block = unsafe { inner.block_ptrs.get_unchecked(obj.block_idx as usize) };
@@ -244,11 +248,13 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
             Self::borrow_or_generation_err(inner, obj);
         }
 
-        slot.state.set(slot.state.get() | ((u32::MAX as u64) << 32));
+        let cell_state = cell_u64_ms_i32(&slot.state);
+        debug_assert_eq!(cell_state.get(), 0);
+        cell_state.set(1);
 
-        ObjMut {
+        ObjRefMut {
             _variance: PhantomData,
-            state: &slot.state,
+            state: cell_state,
             value: NonNull::from(unsafe { (*slot.value.get()).assume_init_mut() }),
         }
     }
@@ -260,13 +266,13 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 }
 
-pub struct ObjMut<'a, T> {
+pub struct ObjRefMut<'a, T> {
     _variance: PhantomData<&'a mut T>,
-    state: &'a Cell<u64>,
+    state: &'a Cell<i32>,
     value: NonNull<T>,
 }
 
-impl<T> Deref for ObjMut<'_, T> {
+impl<T> Deref for ObjRefMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -274,14 +280,14 @@ impl<T> Deref for ObjMut<'_, T> {
     }
 }
 
-impl<T> DerefMut for ObjMut<'_, T> {
+impl<T> DerefMut for ObjRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.value.as_mut() }
     }
 }
 
-impl<T> Drop for ObjMut<'_, T> {
+impl<T> Drop for ObjRefMut<'_, T> {
     fn drop(&mut self) {
-        self.state.set(self.state.get() & (u32::MAX as u64));
+        self.state.set(self.state.get() - 1);
     }
 }
