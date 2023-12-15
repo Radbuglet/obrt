@@ -200,7 +200,10 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     #[cold]
     fn expand_capacity(inner: &mut StorageInner<T>) {
         // Ensure that we haven't created too many blocks yet.
-        assert!(inner.block_ptrs.len() < u16::MAX as usize - 1);
+        assert!(
+            inner.block_ptrs.len() < u16::MAX as usize - 1,
+            "cannot allocate more than ~4.29 gigabytes of storage for a given object type"
+        );
 
         // Determine an index and length for this block. The call to `block_len` validates the
         // layout for this block.
@@ -282,6 +285,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 }
 
+// ObjRefMut
 pub struct ObjRefMut<'a, T> {
     _variance: PhantomData<&'a mut T>,
     state: &'a Cell<i32>,
@@ -352,6 +356,29 @@ mod test {
         }
 
         assert_eq!(4999950000, accum);
+    }
+
+    #[test]
+    fn allocation_capacity_on_right_order() {
+        type Value = [u64; 64];
+        let mut storage = Storage::<Value>::new();
+        let storage = storage.borrow_exclusive_mut();
+
+        let mut bytes_allocated = 0;
+        let alloc_size = std::mem::size_of::<(u64, Value)>();
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+            bytes_allocated += alloc_size;
+            storage.alloc(std::array::from_fn(|_| 0));
+        }));
+
+        println!(
+            "`{err:?}` after allocating {bytes_allocated} bytes ({} objects); delta from ideal is {}",
+            bytes_allocated / alloc_size,
+			u32::MAX as usize - bytes_allocated,
+        );
+
+        assert!(u32::MAX as usize - bytes_allocated < 2_000_000); // ~2 mb of loss are permitted.
     }
 
     fn generate_permuted_chain(n: usize) -> (usize, Vec<usize>) {
