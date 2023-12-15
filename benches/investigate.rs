@@ -608,4 +608,102 @@ fn bench() {
             accum
         });
     });
+
+    c.bench_function("random/contiguous/byte_offset", |c| {
+        struct Item {
+            next: usize,
+            value: u64,
+        }
+
+        let mut items = (0..100_000)
+            .map(|i| Item {
+                next: usize::MAX,
+                value: i + 100,
+            })
+            .collect::<Vec<_>>();
+
+        let (start, targets) = generate_permuted_chain(100_000);
+
+        for (src, target) in targets.into_iter().enumerate() {
+            if target != usize::MAX {
+                items[src].next = target * std::mem::size_of::<Item>();
+            }
+        }
+
+        let start = start * std::mem::size_of::<Item>();
+        let items_ptr = items.as_ptr().cast::<u8>();
+
+        c.iter(|| {
+            let mut cursor = start;
+            let mut accum = 0;
+
+            while cursor != usize::MAX {
+                let item = unsafe { &*items_ptr.add(cursor).cast::<Item>() };
+                accum += item.value;
+                cursor = item.next;
+            }
+
+            accum
+        });
+    });
+
+    c.bench_function("random/obrt/mut", |c| {
+        struct Item {
+            next: Option<Obj<Self>>,
+            value: u64,
+        }
+
+        let mut storage = Storage::<Item>::new();
+        let storage = storage.borrow_exclusive_mut();
+        let items = (0..100_000)
+            .map(|i| {
+                storage.alloc(Item {
+                    next: None,
+                    value: i + 100,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (start, targets) = generate_permuted_chain(100_000);
+
+        for (src, target) in targets.into_iter().enumerate() {
+            if target != usize::MAX {
+                storage.get_mut(items[src]).next = Some(items[target]);
+            }
+        }
+
+        let start = items[start];
+
+        c.iter(|| {
+            let mut cursor = Some(start);
+            let mut accum = 0;
+
+            while let Some(curr) = cursor {
+                let curr = storage.get_mut(curr);
+                accum += curr.value;
+                cursor = curr.next;
+            }
+
+            accum
+        });
+    });
+}
+
+fn generate_permuted_chain(n: usize) -> (usize, Vec<usize>) {
+    fastrand::seed(4);
+
+    let mut remaining = (0..n).collect::<Vec<_>>();
+    let mut chain = (0..n).map(|_| usize::MAX).collect::<Vec<_>>();
+
+    let start = remaining.swap_remove(fastrand::usize(0..remaining.len()));
+    let mut cursor = start;
+
+    while !remaining.is_empty() {
+        let target = remaining.swap_remove(fastrand::usize(0..remaining.len()));
+
+        chain[cursor] = target;
+        cursor = target;
+    }
+
+    (start, chain)
 }
