@@ -1,0 +1,15 @@
+[package]
+name = "bort"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+autoken = "0.1.0"
+beap = { git = "https://github.com/Radbuglet/beap.git", rev = "e0ac59d480d27e23dd0444c306926fe295b33e66", version = "0.1.0" }
+cfgenius = "0.1.0"
+criterion = "0.5.1"
+derive-where = "1.2.6"
+
+[[bench]]
+name = "investigate"
+harness = false
