@@ -651,6 +651,41 @@ fn bench() {
         });
     });
 
+    c.bench_function("random/contiguous/regular", |c| {
+        struct Item {
+            next: usize,
+            value: u64,
+        }
+
+        let mut items = (0..100_000)
+            .map(|i| Item {
+                next: usize::MAX,
+                value: i + 100,
+            })
+            .collect::<Vec<_>>();
+
+        let (start, targets) = generate_permuted_chain(100_000);
+
+        for (src, target) in targets.into_iter().enumerate() {
+            if target != usize::MAX {
+                items[src].next = target;
+            }
+        }
+
+        c.iter(|| {
+            let mut cursor = start;
+            let mut accum = 0;
+
+            while cursor < items.len() {
+                let item = &items[cursor];
+                accum += item.value;
+                cursor = item.next;
+            }
+
+            accum
+        });
+    });
+
     c.bench_function("random/contiguous/byte_offset", |c| {
         struct Item {
             next: usize,

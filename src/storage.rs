@@ -284,19 +284,28 @@ struct StorageInner<T> {
     // slot.
     hammered: u16,
 
+    // The index of the first element in the unbacked blocks list or `u16::MAX` if there are no
+    // blocks without a backing array.
+    unbacked_head: u16,
+
     // We use raw pointers rather than pointers to slices because doing so ensures that the structure
     // has a power-of-two size, which makes computing byte offsets into the array much more efficient.
-    block_ptrs: Vec<NonNull<Slot<T>>>,
+    block_ptrs: Vec<Option<NonNull<Slot<T>>>>,
     block_states: Vec<BlockState>,
 }
 
 struct BlockState {
+    // The index of the previous hammered block or `u16::MAX` if this is the head. If this block is
+    // not actively backed by anything, the block is a member of the unbacked linked list instead.
+    prev_hammered_or_unbacked: u16,
+
+    // The index of the next hammered block or `u16::MAX` if there is no next block. If this block is
+    // not actively backed by anything, the block is a member of the unbacked linked list instead.
+    next_hammered_or_unbacked: u16,
+
     // The byte offset into the block of the first `Slot<T>` instance in the free list. The state
     // of this field is undefined if there is no linked list head.
     free_list_head: u16,
-
-    // The index of the next hammered block or `u16::MAX` if there is no next block.
-    next_hammered: u16,
 
     // The number of slots which are currently allocated.
     non_free_count: u16,
@@ -337,6 +346,7 @@ impl<T> Storage<T> {
     pub const fn new() -> Self {
         Self(UnsafeCell::new(StorageInner {
             hammered: u16::MAX,
+            unbacked_head: u16::MAX,
             block_ptrs: Vec::new(),
             block_states: Vec::new(),
         }))
@@ -415,7 +425,9 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         sound_assert!(block_idx != u16::MAX); // block actually initialized?
         sound_assert!((block_idx as usize) < inner.block_states.len()); // index is valid?
 
-        let block_ptr = *unsafe { inner.block_ptrs.get_unchecked(block_idx as usize) };
+        let block_ptr = unsafe { inner.block_ptrs.get_unchecked(block_idx as usize) };
+        sound_assert!(block_ptr.is_some()); // block is backed?
+        let block_ptr = unsafe { block_ptr.unwrap_unchecked() };
         let block_state = unsafe { inner.block_states.get_unchecked_mut(block_idx as usize) };
 
         // Fetch the slot in the block.
@@ -431,7 +443,18 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
 
         // If the slot is now empty, move on to the next hammered block.
         if next_slot == Self::SLOT_SENTINEL {
-            inner.hammered = block_state.next_hammered;
+            // Set the new head of the list
+            inner.hammered = block_state.next_hammered_or_unbacked;
+
+            // If that's a real element, set its left reference.
+            let new_head = inner.hammered;
+            if new_head != u16::MAX {
+                sound_assert!((new_head as usize) < inner.block_states.len()); // index is valid?
+                let new_hammered_state =
+                    unsafe { inner.block_states.get_unchecked_mut(new_head as usize) };
+
+                new_hammered_state.prev_hammered_or_unbacked = u16::MAX;
+            }
         } else {
             sound_assert!(Self::is_valid_slot_offset(block_idx, next_slot));
         }
@@ -487,11 +510,18 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         }));
         let alloc = NonNull::from(Box::leak(alloc)).cast::<Slot<T>>();
 
+        // Set left link for old hammered block.
+        let old_head = inner.hammered;
+        if old_head != u16::MAX {
+            inner.block_states[old_head as usize].prev_hammered_or_unbacked = block_idx;
+        }
+
         // Register the block and push it to the front of the hammered block list.
-        inner.block_ptrs.push(alloc);
+        inner.block_ptrs.push(Some(alloc));
         inner.block_states.push(BlockState {
+            prev_hammered_or_unbacked: u16::MAX,
+            next_hammered_or_unbacked: old_head,
             free_list_head: 0,
-            next_hammered: inner.hammered,
             non_free_count: 0,
         });
         inner.hammered = block_idx;
@@ -515,7 +545,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+        let Some(Some(block)) = inner.block_ptrs.get(obj.block_idx as usize) else {
             return false;
         };
 
@@ -531,7 +561,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+        let Some(Some(block)) = inner.block_ptrs.get(obj.block_idx as usize) else {
             return Err(AccessRefError::Dead(Self::make_trivial_generation_err(obj)));
         };
 
@@ -568,7 +598,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+        let Some(Some(block)) = inner.block_ptrs.get(obj.block_idx as usize) else {
             return Err(AccessMutError::Dead(Self::make_trivial_generation_err(obj)));
         };
 
@@ -602,7 +632,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+        let Some(Some(block)) = inner.block_ptrs.get(obj.block_idx as usize) else {
             Self::raise_trivial_generation_err(obj);
         };
 
@@ -640,7 +670,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+        let Some(Some(block)) = inner.block_ptrs.get(obj.block_idx as usize) else {
             Self::raise_trivial_generation_err(obj);
         };
 
