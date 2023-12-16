@@ -15,6 +15,104 @@ use crate::{
     util::{cell_u64_ms_i32, cell_u64_ms_u32, PtrExt},
 };
 
+// === Borrow tracker === //
+
+cfgenius::define!(pub tracks_borrow_location = cfg(debug_assertions));
+
+cfgenius::cond! {
+    if macro(tracks_borrow_location) {
+        use std::panic::Location;
+
+        #[derive(Debug, Clone)]
+        struct BorrowTracker(Cell<Option<&'static Location<'static>>>);
+
+        impl BorrowTracker {
+            pub const fn new() -> Self {
+                Self(Cell::new(None))
+            }
+
+            #[inline(always)]
+            #[track_caller]
+            pub fn set(&self) {
+                self.0.set(Some(Location::caller()));
+            }
+        }
+    } else {
+        #[derive(Debug, Clone)]
+        struct BorrowTracker(());
+
+        impl BorrowTracker {
+            pub const fn new() -> Self {
+                Self(())
+            }
+
+            #[inline(always)]
+            pub fn set(&self) {}
+        }
+    }
+}
+
+// === Consistency Checks === //
+
+cfgenius::define!(pub checks_consistency = false());
+
+cfgenius::cond! {
+    if macro(checks_consistency) {
+        macro_rules! sound_assert {
+            ($($args:tt)*) => {
+                assert!($($args)*);
+            };
+        }
+    } else {
+        macro_rules! sound_assert {
+            ($($args:tt)*) => {
+                if false {
+                    assert!($($args)*);
+                }
+            };
+        }
+    }
+}
+
+// === BorrowGuard === //
+
+type BorrowGuardMut<'a> = BorrowGuard<'a, true>;
+type BorrowGuardRef<'a> = BorrowGuard<'a, false>;
+
+struct BorrowGuard<'a, const MUT: bool>(&'a Cell<i32>);
+
+impl<const MUT: bool> Clone for BorrowGuard<'_, MUT> {
+    fn clone(&self) -> Self {
+        if MUT {
+            self.0.set(
+                self.0
+                    .get()
+                    .checked_sub(1)
+                    .expect("too many mutable borrows"),
+            );
+        } else {
+            self.0.set(
+                self.0
+                    .get()
+                    .checked_add(1)
+                    .expect("too many immutable borrows"),
+            );
+        }
+
+        Self(self.0)
+    }
+}
+
+impl<const MUT: bool> Drop for BorrowGuard<'_, MUT> {
+    fn drop(&mut self) {
+        if MUT {
+            self.0.set(self.0.get() + 1);
+        } else {
+            self.0.set(self.0.get() - 1);
+        }
+    }
+}
+
 // === Storage === //
 
 // Data structures
@@ -45,6 +143,8 @@ struct BlockState {
 }
 
 struct Slot<T> {
+    borrow_location: BorrowTracker,
+
     // This is secretly two 32 bit numbers in disguise. From LSB to MSB...
     //
     // - The first 32 bits indicate the generation. When the slot is dead, this is set to the
@@ -151,16 +251,16 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         // Fetch the hammered block.
         let block_idx = inner.hammered;
 
-        debug_assert_eq!(inner.block_ptrs.len(), inner.block_states.len()); // size invariant met?
-        debug_assert_ne!(block_idx, u16::MAX); // block actually initialized?
-        debug_assert!((block_idx as usize) < inner.block_states.len()); // index is valid?
+        sound_assert!(inner.block_ptrs.len() == inner.block_states.len()); // size invariant met?
+        sound_assert!(block_idx != u16::MAX); // block actually initialized?
+        sound_assert!((block_idx as usize) < inner.block_states.len()); // index is valid?
 
         let block_ptr = *unsafe { inner.block_ptrs.get_unchecked(block_idx as usize) };
         let block_state = unsafe { inner.block_states.get_unchecked_mut(block_idx as usize) };
 
         // Fetch the slot in the block.
         let slot_offset = block_state.free_list_head;
-        debug_assert!(Self::is_valid_slot_offset(block_idx, slot_offset));
+        sound_assert!(Self::is_valid_slot_offset(block_idx, slot_offset));
 
         let slot = unsafe { block_ptr.add_addr(slot_offset as usize).as_ref() };
 
@@ -173,14 +273,14 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         if next_slot == Self::SLOT_SENTINEL {
             inner.hammered = block_state.next_hammered;
         } else {
-            debug_assert!(Self::is_valid_slot_offset(block_idx, next_slot));
+            sound_assert!(Self::is_valid_slot_offset(block_idx, next_slot));
         }
 
         // Zero the slot state to mark it as borrowable and fetch the generation.
         let slot_state = slot.state.get();
         let generation = slot_state as u32;
 
-        debug_assert_ne!(generation, 0);
+        sound_assert!(generation != 0);
         slot.state.set(generation as u64);
 
         let generation = unsafe { NonZeroU32::new_unchecked(generation) };
@@ -220,6 +320,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
             };
 
             Slot {
+                borrow_location: BorrowTracker::new(),
                 state: Cell::new(generation + ((next_free as u64) << 32)),
                 value: UnsafeCell::new(MaybeUninit::<T>::uninit()),
             }
@@ -242,7 +343,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     fn block_len(idx: u16) -> u16 {
-        debug_assert_ne!(idx, u16::MAX);
+        sound_assert!(idx != u16::MAX);
         u16::MAX.min(Self::MAX_COUNT)
     }
 
@@ -251,47 +352,69 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     #[inline]
+    #[track_caller]
     pub fn get(self, obj: Obj<T>) -> ObjRef<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
-        let block = unsafe { inner.block_ptrs.get_unchecked(obj.block_idx as usize) };
+        // Fetch the requested block
+        let block = inner.block_ptrs[obj.block_idx as usize];
 
-        debug_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
         let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
 
+        // Ensure that it is borrowable and that doing so will not overflow the counter
         const MASK: u64 = (1 << 63) | (1 << 62) | (u32::MAX as u64);
         if slot.state.get() & MASK != obj.generation.get() as u64 {
             Self::borrow_ref_or_generation_err(slot);
         }
 
+        // If this is the first immutable borrow, set the location.
+        if slot.state.get() == obj.generation.get() as u64 {
+            slot.borrow_location.set();
+        }
+
+        // Increment the immutable borrow counter
         slot.state.set(slot.state.get().wrapping_add(1 << 32));
 
+        // Construct a guard
+        let cell_state = cell_u64_ms_i32(&slot.state);
+        sound_assert!(cell_state.get() > 0);
+
         ObjRef {
-            state: cell_u64_ms_i32(&slot.state),
+            _borrow: BorrowGuard(cell_u64_ms_i32(&slot.state)),
             value: NonNull::from(unsafe { (*slot.value.get()).assume_init_ref() }),
         }
     }
 
     #[inline]
+    #[track_caller]
     pub fn get_mut(self, obj: Obj<T>) -> ObjRefMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
-        let block = unsafe { inner.block_ptrs.get_unchecked(obj.block_idx as usize) };
+        // Fetch the requested block
+        let block = inner.block_ptrs[obj.block_idx as usize];
 
-        debug_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
         let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
 
+        // Ensure that it is borrowable
         if slot.state.get() != obj.generation.get() as u64 {
             Self::borrow_mut_or_generation_err(slot);
         }
 
+        // Since this is the first mutable borrow, set the location.
+        slot.borrow_location.set();
+
+        // Set the borrow counter
         let cell_state = cell_u64_ms_i32(&slot.state);
-        debug_assert_eq!(cell_state.get(), 0);
+        sound_assert!(cell_state.get() == 0);
         cell_state.set(-1);
 
         ObjRefMut {
             _variance: PhantomData,
-            state: cell_state,
+            _borrow: BorrowGuard(cell_state),
             value: NonNull::from(unsafe { (*slot.value.get()).assume_init_mut() }),
         }
     }
@@ -309,7 +432,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
 
 // ObjRef
 pub struct ObjRef<'a, T> {
-    state: &'a Cell<i32>,
+    _borrow: BorrowGuardRef<'a>,
     value: NonNull<T>,
 }
 
@@ -321,16 +444,10 @@ impl<T> Deref for ObjRef<'_, T> {
     }
 }
 
-impl<T> Drop for ObjRef<'_, T> {
-    fn drop(&mut self) {
-        self.state.set(self.state.get() - 1);
-    }
-}
-
 // ObjRefMut
 pub struct ObjRefMut<'a, T> {
     _variance: PhantomData<&'a mut T>,
-    state: &'a Cell<i32>,
+    _borrow: BorrowGuardMut<'a>,
     value: NonNull<T>,
 }
 
@@ -345,12 +462,6 @@ impl<T> Deref for ObjRefMut<'_, T> {
 impl<T> DerefMut for ObjRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.value.as_mut() }
-    }
-}
-
-impl<T> Drop for ObjRefMut<'_, T> {
-    fn drop(&mut self) {
-        self.state.set(self.state.get() + 1);
     }
 }
 
