@@ -57,8 +57,8 @@ struct Slot<T> {
     // Borrow state format:
     //
     // - 0 means unborrowed
-    // - positive means mutably borrowed
-    // - negative means immutably borrowed
+    // - positive means immutably borrowed
+    // - negative means mutably borrowed
     //
     state: Cell<u64>,
     value: UnsafeCell<MaybeUninit<T>>,
@@ -250,8 +250,26 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         todo!();
     }
 
-    pub fn get(self) {
-        todo!();
+    #[inline]
+    pub fn get(self, obj: Obj<T>) -> ObjRef<'a, T> {
+        let inner = unsafe { &*self.inner.0.get() };
+
+        let block = unsafe { inner.block_ptrs.get_unchecked(obj.block_idx as usize) };
+
+        debug_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
+
+        const MASK: u64 = (1 << 63) | (1 << 62) | (u32::MAX as u64);
+        if slot.state.get() & MASK != obj.generation.get() as u64 {
+            Self::borrow_ref_or_generation_err(slot);
+        }
+
+        slot.state.set(slot.state.get().wrapping_add(1 << 32));
+
+        ObjRef {
+            state: cell_u64_ms_i32(&slot.state),
+            value: NonNull::from(unsafe { (*slot.value.get()).assume_init_ref() }),
+        }
     }
 
     #[inline]
@@ -264,12 +282,12 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
 
         if slot.state.get() != obj.generation.get() as u64 {
-            Self::borrow_or_generation_err(inner, obj);
+            Self::borrow_mut_or_generation_err(slot);
         }
 
         let cell_state = cell_u64_ms_i32(&slot.state);
         debug_assert_eq!(cell_state.get(), 0);
-        cell_state.set(1);
+        cell_state.set(-1);
 
         ObjRefMut {
             _variance: PhantomData,
@@ -279,9 +297,33 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     #[cold]
-    fn borrow_or_generation_err(inner: &StorageInner<T>, obj: Obj<T>) -> ! {
-        let _ = (inner, obj);
-        panic!("a big bad has occurred");
+    fn borrow_ref_or_generation_err(_slot: &Slot<T>) -> ! {
+        panic!("a big bad has occurred (ref)");
+    }
+
+    #[cold]
+    fn borrow_mut_or_generation_err(_slot: &Slot<T>) -> ! {
+        panic!("a big bad has occurred (mut)");
+    }
+}
+
+// ObjRef
+pub struct ObjRef<'a, T> {
+    state: &'a Cell<i32>,
+    value: NonNull<T>,
+}
+
+impl<T> Deref for ObjRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.value.as_ref() }
+    }
+}
+
+impl<T> Drop for ObjRef<'_, T> {
+    fn drop(&mut self) {
+        self.state.set(self.state.get() - 1);
     }
 }
 
@@ -308,7 +350,7 @@ impl<T> DerefMut for ObjRefMut<'_, T> {
 
 impl<T> Drop for ObjRefMut<'_, T> {
     fn drop(&mut self) {
-        self.state.set(self.state.get() - 1);
+        self.state.set(self.state.get() + 1);
     }
 }
 
@@ -359,6 +401,7 @@ mod test {
     }
 
     #[test]
+    #[ignore = "expensive"]
     fn allocation_capacity_on_right_order() {
         type Value = [u64; 64];
         let mut storage = Storage::<Value>::new();
@@ -367,19 +410,56 @@ mod test {
         let mut bytes_allocated = 0;
         let alloc_size = std::mem::size_of::<(u64, Value)>();
 
-        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+        assert_panics(|| loop {
             bytes_allocated += alloc_size;
             storage.alloc(std::array::from_fn(|_| 0));
-        }));
+        });
 
         println!(
-            "`{err:?}` after allocating {bytes_allocated} bytes ({} objects); delta from ideal is {}",
+            "Failed after allocating {bytes_allocated} bytes ({} objects); delta from ideal is {}",
             bytes_allocated / alloc_size,
-			u32::MAX as usize - bytes_allocated,
+            u32::MAX as usize - bytes_allocated,
         );
 
         assert!(u32::MAX as usize - bytes_allocated < 2_000_000); // ~2 mb of loss are permitted.
     }
+
+    #[test]
+    fn storage_ref_celled_properly() {
+        let mut storage = Storage::new();
+        let storage = storage.borrow_exclusive_mut();
+        let obj = storage.alloc(1);
+
+        let a = storage.get(obj);
+        let b = storage.get(obj);
+        assert_panics(|| storage.get_mut(obj));
+        drop(a);
+        assert_panics(|| storage.get_mut(obj));
+        drop(b);
+        let c = storage.get_mut(obj);
+        assert_panics(|| storage.get(obj));
+        assert_panics(|| storage.get_mut(obj));
+        drop(c);
+        let _d = storage.get(obj);
+    }
+
+    #[test]
+    #[ignore = "expensive"]
+    fn storage_ref_cell_does_not_overflow() {
+        let mut storage = Storage::new();
+        let storage = storage.borrow_exclusive_mut();
+        let obj = storage.alloc(1);
+
+        for _ in 0..(1 << 30) {
+            std::mem::forget(storage.get(obj));
+        }
+
+        assert_panics(|| {
+            storage.get(obj);
+        });
+    }
+
+    // === Helpers === //
 
     fn generate_permuted_chain(n: usize) -> (usize, Vec<usize>) {
         fastrand::seed(4);
@@ -398,5 +478,20 @@ mod test {
         }
 
         (start, chain)
+    }
+
+    fn assert_panics<R>(f: impl FnOnce() -> R) {
+        use std::panic::*;
+
+        let hook = take_hook();
+        set_hook(Box::new(|_info| {}));
+
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            f();
+        }));
+
+        set_hook(hook);
+
+        assert!(res.is_err());
     }
 }

@@ -41,5 +41,5 @@ pub fn cell_u64_ms_u32(v: &Cell<u64>) -> &Cell<u32> {
 }
 
 pub fn cell_u64_ms_i32(v: &Cell<u64>) -> &Cell<i32> {
-	cell_u32_to_i32(cell_u64_ms_u32(v))
+    cell_u32_to_i32(cell_u64_ms_u32(v))
 }

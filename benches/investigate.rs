@@ -567,6 +567,48 @@ fn bench() {
         });
     });
 
+    c.bench_function("sequential/obrt/ref", |c| {
+        #[derive(Default)]
+        struct Item {
+            next: Option<Obj<Self>>,
+            value: u64,
+        }
+
+        let mut storage = Storage::<Item>::new();
+        let storage = storage.borrow_exclusive_mut();
+
+        let head;
+        {
+            let mut curr = storage.alloc(Item {
+                next: None,
+                value: 100,
+            });
+            head = curr;
+
+            for i in 1..100_000 {
+                let next = storage.alloc(Item {
+                    next: None,
+                    value: i + 100,
+                });
+                storage.get_mut(curr).next = Some(next);
+                curr = next;
+            }
+        }
+
+        c.iter(|| {
+            let mut cursor = Some(head);
+            let mut accum = 0;
+
+            while let Some(curr) = cursor {
+                let curr = storage.get(curr);
+                accum += curr.value;
+                cursor = curr.next;
+            }
+
+            accum
+        });
+    });
+
     c.bench_function("sequential/obrt/mut", |c| {
         #[derive(Default)]
         struct Item {
@@ -641,6 +683,47 @@ fn bench() {
                 let item = unsafe { &*items_ptr.add(cursor).cast::<Item>() };
                 accum += item.value;
                 cursor = item.next;
+            }
+
+            accum
+        });
+    });
+
+    c.bench_function("random/obrt/ref", |c| {
+        struct Item {
+            next: Option<Obj<Self>>,
+            value: u64,
+        }
+
+        let mut storage = Storage::<Item>::new();
+        let storage = storage.borrow_exclusive_mut();
+        let items = (0..100_000)
+            .map(|i| {
+                storage.alloc(Item {
+                    next: None,
+                    value: i + 100,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (start, targets) = generate_permuted_chain(100_000);
+
+        for (src, target) in targets.into_iter().enumerate() {
+            if target != usize::MAX {
+                storage.get_mut(items[src]).next = Some(items[target]);
+            }
+        }
+
+        let start = items[start];
+
+        c.iter(|| {
+            let mut cursor = Some(start);
+            let mut accum = 0;
+
+            while let Some(curr) = cursor {
+                let curr = storage.get(curr);
+                accum += curr.value;
+                cursor = curr.next;
             }
 
             accum
