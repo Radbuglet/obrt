@@ -194,6 +194,7 @@ cfgenius::cond! {
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub enum AccessMutError {
     Dead(ObjDeadError),
@@ -211,6 +212,7 @@ impl fmt::Display for AccessMutError {
 
 impl Error for AccessMutError {}
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub enum AccessRefError {
     Dead(ObjDeadError),
@@ -228,6 +230,7 @@ impl fmt::Display for AccessRefError {
 
 impl Error for AccessRefError {}
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct ObjDeadError {
     slot_gen: u32,
@@ -246,6 +249,7 @@ impl fmt::Display for ObjDeadError {
 
 impl Error for ObjDeadError {}
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct BorrowMutError(CommonBorrowError<true>);
 
@@ -257,6 +261,7 @@ impl fmt::Display for BorrowMutError {
 
 impl Error for BorrowMutError {}
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct BorrowRefError(CommonBorrowError<false>);
 
@@ -506,6 +511,91 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         todo!();
     }
 
+    pub fn is_alive(self, obj: Obj<T>) -> bool {
+        let inner = unsafe { &*self.inner.0.get() };
+
+        // Fetch the requested block
+        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            return false;
+        };
+
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
+
+        // Validate generation
+        slot.state.get() as u32 == obj.generation.get()
+    }
+
+    pub fn try_get(self, obj: Obj<T>) -> Result<ObjRef<'a, T>, AccessRefError> {
+        let inner = unsafe { &*self.inner.0.get() };
+
+        // Fetch the requested block
+        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            return Err(AccessRefError::Dead(Self::make_trivial_generation_err(obj)));
+        };
+
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
+
+        // Ensure that it is borrowable and that doing so will not overflow the counter
+        const MASK: u64 = (1 << 63) | (1 << 62) | (u32::MAX as u64);
+        if slot.state.get() & MASK != obj.generation.get() as u64 {
+            return Err(Self::make_borrow_ref_or_generation_err(slot, obj));
+        }
+
+        // If this is the first immutable borrow, set the location.
+        if slot.state.get() == obj.generation.get() as u64 {
+            slot.borrow_location.set();
+        }
+
+        // Increment the immutable borrow counter
+        slot.state.set(slot.state.get().wrapping_add(1 << 32));
+
+        // Construct a guard
+        let cell_state = cell_u64_ms_i32(&slot.state);
+        sound_assert!(cell_state.get() > 0);
+
+        Ok(ObjRef {
+            borrow: BorrowGuard(cell_u64_ms_i32(&slot.state)),
+            value: NonNull::from(unsafe { (*slot.value.get()).assume_init_ref() }),
+        })
+    }
+
+    #[track_caller]
+    pub fn try_get_mut(self, obj: Obj<T>) -> Result<ObjRefMut<'a, T>, AccessMutError> {
+        let inner = unsafe { &*self.inner.0.get() };
+
+        // Fetch the requested block
+        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            return Err(AccessMutError::Dead(Self::make_trivial_generation_err(obj)));
+        };
+
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        let slot = unsafe { block.add_addr(obj.slot_offset as usize).as_ref() };
+
+        // Ensure that it is borrowable
+        if slot.state.get() != obj.generation.get() as u64 {
+            return Err(Self::make_borrow_mut_or_generation_err(slot, obj));
+        }
+
+        // Since this is the first mutable borrow, set the location.
+        slot.borrow_location.set();
+
+        // Set the borrow counter
+        let cell_state = cell_u64_ms_i32(&slot.state);
+        sound_assert!(cell_state.get() == 0);
+        cell_state.set(-1);
+
+        Ok(ObjRefMut {
+            _variance: PhantomData,
+            borrow: BorrowGuard(cell_state),
+            value: NonNull::from(unsafe { (*slot.value.get()).assume_init_mut() }),
+        })
+    }
+
     #[inline]
     #[track_caller]
     pub fn get(self, obj: Obj<T>) -> ObjRef<'a, T> {
@@ -539,7 +629,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         sound_assert!(cell_state.get() > 0);
 
         ObjRef {
-            _borrow: BorrowGuard(cell_u64_ms_i32(&slot.state)),
+            borrow: BorrowGuard(cell_u64_ms_i32(&slot.state)),
             value: NonNull::from(unsafe { (*slot.value.get()).assume_init_ref() }),
         }
     }
@@ -573,33 +663,34 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
 
         ObjRefMut {
             _variance: PhantomData,
-            _borrow: BorrowGuard(cell_state),
+            borrow: BorrowGuard(cell_state),
             value: NonNull::from(unsafe { (*slot.value.get()).assume_init_mut() }),
         }
     }
 
     #[cold]
     fn raise_trivial_generation_err(obj: Obj<T>) -> ! {
-        panic!(
-            "{}",
-            ObjDeadError {
-                handle_gen: obj.generation.get(),
-                slot_gen: 0
-            }
-        );
+        panic!("{}", Self::make_trivial_generation_err(obj));
     }
 
     #[cold]
     fn raise_borrow_ref_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> ! {
-        panic!("{}", Self::make_ref_or_generation_err(slot, obj));
+        panic!("{}", Self::make_borrow_ref_or_generation_err(slot, obj));
     }
 
     #[cold]
     fn raise_borrow_mut_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> ! {
-        panic!("{}", Self::make_mut_or_generation_err(slot, obj));
+        panic!("{}", Self::make_borrow_mut_or_generation_err(slot, obj));
     }
 
-    fn make_ref_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessRefError {
+    fn make_trivial_generation_err(obj: Obj<T>) -> ObjDeadError {
+        ObjDeadError {
+            handle_gen: obj.generation.get(),
+            slot_gen: 0,
+        }
+    }
+
+    fn make_borrow_ref_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessRefError {
         let slot_gen = slot.state.get() as u32;
         let handle_gen = obj.generation.get();
         if slot_gen != handle_gen {
@@ -612,7 +703,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         }
     }
 
-    fn make_mut_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessMutError {
+    fn make_borrow_mut_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessMutError {
         let slot_gen = slot.state.get() as u32;
         let handle_gen = obj.generation.get();
         if slot_gen != handle_gen {
@@ -627,27 +718,167 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
 }
 
 // ObjRef
-pub struct ObjRef<'a, T> {
-    _borrow: BorrowGuardRef<'a>,
+pub struct ObjRef<'a, T: ?Sized> {
+    borrow: BorrowGuardRef<'a>,
     value: NonNull<T>,
 }
 
-impl<T> Deref for ObjRef<'_, T> {
+impl<'a, T: ?Sized> ObjRef<'a, T> {
+    #[allow(clippy::should_implement_trait)] // std does this
+    pub fn clone(orig: &ObjRef<'a, T>) -> ObjRef<'a, T> {
+        ObjRef {
+            borrow: orig.borrow.clone(),
+            value: orig.value,
+        }
+    }
+
+    pub fn map<U, F>(orig: ObjRef<'a, T>, f: F) -> ObjRef<'a, U>
+    where
+        F: FnOnce(&T) -> &U,
+        U: ?Sized,
+    {
+        let ObjRef { borrow, value } = orig;
+        let value = NonNull::from(f(unsafe { value.as_ref() }));
+        ObjRef { borrow, value }
+    }
+
+    pub fn filter_map<U, F>(orig: ObjRef<'a, T>, f: F) -> Result<ObjRef<'a, U>, ObjRef<'a, T>>
+    where
+        F: FnOnce(&T) -> Option<&U>,
+        U: ?Sized,
+    {
+        let ObjRef { borrow, value } = orig;
+        if let Some(value) = f(unsafe { value.as_ref() }) {
+            Ok(ObjRef {
+                borrow,
+                value: NonNull::from(value),
+            })
+        } else {
+            Err(ObjRef { borrow, value })
+        }
+    }
+
+    pub fn map_slit<U, V, F>(orig: ObjRef<'a, T>, f: F) -> (ObjRef<'a, U>, ObjRef<'a, V>)
+    where
+        F: FnOnce(&T) -> (&U, &V),
+        U: ?Sized,
+        V: ?Sized,
+    {
+        let ObjRef { borrow, value } = orig;
+        let (a, b) = f(unsafe { value.as_ref() });
+
+        (
+            ObjRef {
+                borrow: borrow.clone(),
+                value: NonNull::from(a),
+            },
+            ObjRef {
+                borrow,
+                value: NonNull::from(b),
+            },
+        )
+    }
+}
+
+impl<T: ?Sized> Deref for ObjRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.value.as_ref() }
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for ObjRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
 // ObjRefMut
-pub struct ObjRefMut<'a, T> {
+pub struct ObjRefMut<'a, T: ?Sized> {
     _variance: PhantomData<&'a mut T>,
-    _borrow: BorrowGuardMut<'a>,
+    borrow: BorrowGuardMut<'a>,
     value: NonNull<T>,
 }
 
-impl<T> Deref for ObjRefMut<'_, T> {
+impl<'a, T: ?Sized> ObjRefMut<'a, T> {
+    pub fn map<U, F>(orig: ObjRefMut<'a, T>, f: F) -> ObjRefMut<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+        U: ?Sized,
+    {
+        let ObjRefMut {
+            borrow, mut value, ..
+        } = orig;
+        let value = NonNull::from(f(unsafe { value.as_mut() }));
+
+        ObjRefMut {
+            _variance: PhantomData,
+            borrow,
+            value,
+        }
+    }
+
+    pub fn filter_map<U, F>(
+        orig: ObjRefMut<'a, T>,
+        f: F,
+    ) -> Result<ObjRefMut<'a, U>, ObjRefMut<'a, T>>
+    where
+        F: FnOnce(&mut T) -> Option<&mut U>,
+        U: ?Sized,
+    {
+        let ObjRefMut {
+            borrow, mut value, ..
+        } = orig;
+
+        if let Some(value) = f(unsafe { value.as_mut() }) {
+            Ok(ObjRefMut {
+                _variance: PhantomData,
+                borrow,
+                value: NonNull::from(value),
+            })
+        } else {
+            Err(ObjRefMut {
+                _variance: PhantomData,
+                borrow,
+                value,
+            })
+        }
+    }
+
+    pub fn map_slit<U, V, F>(orig: ObjRefMut<'a, T>, f: F) -> (ObjRefMut<'a, U>, ObjRefMut<'a, V>)
+    where
+        F: FnOnce(&mut T) -> (&mut U, &mut V),
+        U: ?Sized,
+        V: ?Sized,
+    {
+        let ObjRefMut {
+            borrow, mut value, ..
+        } = orig;
+        let (a, b) = f(unsafe { value.as_mut() });
+
+        (
+            ObjRefMut {
+                _variance: PhantomData,
+                borrow: borrow.clone(),
+                value: NonNull::from(a),
+            },
+            ObjRefMut {
+                _variance: PhantomData,
+                borrow,
+                value: NonNull::from(b),
+            },
+        )
+    }
+}
+
+impl<T: ?Sized> Deref for ObjRefMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -655,9 +886,21 @@ impl<T> Deref for ObjRefMut<'_, T> {
     }
 }
 
-impl<T> DerefMut for ObjRefMut<'_, T> {
+impl<T: ?Sized> DerefMut for ObjRefMut<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.value.as_mut() }
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRefMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for ObjRefMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
     }
 }
 
