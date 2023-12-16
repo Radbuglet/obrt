@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, UnsafeCell},
+    error::Error,
     fmt,
     marker::PhantomData,
     mem::{size_of, MaybeUninit},
@@ -112,6 +113,160 @@ impl<const MUT: bool> Drop for BorrowGuard<'_, MUT> {
         }
     }
 }
+
+// === AccessError === //
+
+fn fmt_error_common_prefix(
+    f: &mut fmt::Formatter<'_>,
+    slot_state: i32,
+    mutable: bool,
+) -> fmt::Result {
+    write!(
+        f,
+        "failed to borrow obj {}: ",
+        if mutable { "mutably" } else { "immutably" }
+    )?;
+
+    let confounding = slot_state.unsigned_abs();
+    write!(
+        f,
+        "cell is borrowed by {confounding} {}{}",
+        if mutable { "reader" } else { "writer" },
+        if confounding == 1 { "" } else { "s" }
+    )?;
+
+    Ok(())
+}
+
+cfgenius::cond! {
+    if macro(tracks_borrow_location) {
+        #[derive(Debug, Clone)]
+        struct CommonBorrowError<const MUT: bool> {
+            location: Option<&'static Location<'static>>,
+            slot_state: i32,
+        }
+
+        impl<const MUT: bool> CommonBorrowError<MUT> {
+            fn new<T>(slot: &Slot<T>) -> Self {
+                Self {
+                    location: slot.borrow_location.0.get(),
+                    slot_state: cell_u64_ms_i32(&slot.state).get(),
+                }
+            }
+        }
+
+        impl<const MUT: bool> fmt::Display for CommonBorrowError<MUT> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt_error_common_prefix(f, self.slot_state, MUT)?;
+
+                if let Some(location) = self.location {
+                    write!(
+                        f,
+                        " (first borrow location: {} at {}:{})",
+                        location.file(),
+                        location.line(),
+                        location.column(),
+                    )?;
+                }
+
+                Ok(())
+            }
+        }
+    } else {
+        #[derive(Debug, Clone)]
+        struct CommonBorrowError<const MUT: bool> {
+            slot_state: i32,
+        }
+
+        impl<const MUT: bool> CommonBorrowError<MUT> {
+            fn new<T>(slot: &Slot<T>) -> Self {
+                Self {
+                    slot_state: cell_u64_ms_i32(&slot.state).get(),
+                }
+            }
+        }
+
+        impl<const MUT: bool> fmt::Display for CommonBorrowError<MUT> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt_error_common_prefix(f, self.slot_state, MUT)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AccessMutError {
+    Dead(ObjDeadError),
+    Borrow(BorrowMutError),
+}
+
+impl fmt::Display for AccessMutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessMutError::Dead(err) => fmt::Display::fmt(err, f),
+            AccessMutError::Borrow(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for AccessMutError {}
+
+#[derive(Debug, Clone)]
+pub enum AccessRefError {
+    Dead(ObjDeadError),
+    Borrow(BorrowRefError),
+}
+
+impl fmt::Display for AccessRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessRefError::Dead(err) => fmt::Display::fmt(err, f),
+            AccessRefError::Borrow(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for AccessRefError {}
+
+#[derive(Debug, Clone)]
+pub struct ObjDeadError {
+    slot_gen: u32,
+    handle_gen: u32,
+}
+
+impl fmt::Display for ObjDeadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "obj is dead: slot has generation {} but handle has generation {}",
+            self.slot_gen, self.handle_gen,
+        )
+    }
+}
+
+impl Error for ObjDeadError {}
+
+#[derive(Debug, Clone)]
+pub struct BorrowMutError(CommonBorrowError<true>);
+
+impl fmt::Display for BorrowMutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Error for BorrowMutError {}
+
+#[derive(Debug, Clone)]
+pub struct BorrowRefError(CommonBorrowError<false>);
+
+impl fmt::Display for BorrowRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Error for BorrowRefError {}
 
 // === Storage === //
 
@@ -357,7 +512,9 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let block = inner.block_ptrs[obj.block_idx as usize];
+        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            Self::raise_trivial_generation_err(obj);
+        };
 
         // Fetch the requested slot
         sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
@@ -366,7 +523,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         // Ensure that it is borrowable and that doing so will not overflow the counter
         const MASK: u64 = (1 << 63) | (1 << 62) | (u32::MAX as u64);
         if slot.state.get() & MASK != obj.generation.get() as u64 {
-            Self::borrow_ref_or_generation_err(slot);
+            Self::raise_borrow_ref_or_generation_err(slot, obj);
         }
 
         // If this is the first immutable borrow, set the location.
@@ -393,7 +550,9 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let inner = unsafe { &*self.inner.0.get() };
 
         // Fetch the requested block
-        let block = inner.block_ptrs[obj.block_idx as usize];
+        let Some(block) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            Self::raise_trivial_generation_err(obj);
+        };
 
         // Fetch the requested slot
         sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
@@ -401,7 +560,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
 
         // Ensure that it is borrowable
         if slot.state.get() != obj.generation.get() as u64 {
-            Self::borrow_mut_or_generation_err(slot);
+            Self::raise_borrow_mut_or_generation_err(slot, obj);
         }
 
         // Since this is the first mutable borrow, set the location.
@@ -420,13 +579,50 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
     }
 
     #[cold]
-    fn borrow_ref_or_generation_err(_slot: &Slot<T>) -> ! {
-        panic!("a big bad has occurred (ref)");
+    fn raise_trivial_generation_err(obj: Obj<T>) -> ! {
+        panic!(
+            "{}",
+            ObjDeadError {
+                handle_gen: obj.generation.get(),
+                slot_gen: 0
+            }
+        );
     }
 
     #[cold]
-    fn borrow_mut_or_generation_err(_slot: &Slot<T>) -> ! {
-        panic!("a big bad has occurred (mut)");
+    fn raise_borrow_ref_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> ! {
+        panic!("{}", Self::make_ref_or_generation_err(slot, obj));
+    }
+
+    #[cold]
+    fn raise_borrow_mut_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> ! {
+        panic!("{}", Self::make_mut_or_generation_err(slot, obj));
+    }
+
+    fn make_ref_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessRefError {
+        let slot_gen = slot.state.get() as u32;
+        let handle_gen = obj.generation.get();
+        if slot_gen != handle_gen {
+            AccessRefError::Dead(ObjDeadError {
+                slot_gen,
+                handle_gen,
+            })
+        } else {
+            AccessRefError::Borrow(BorrowRefError(CommonBorrowError::new(slot)))
+        }
+    }
+
+    fn make_mut_or_generation_err(slot: &Slot<T>, obj: Obj<T>) -> AccessMutError {
+        let slot_gen = slot.state.get() as u32;
+        let handle_gen = obj.generation.get();
+        if slot_gen != handle_gen {
+            AccessMutError::Dead(ObjDeadError {
+                slot_gen,
+                handle_gen,
+            })
+        } else {
+            AccessMutError::Borrow(BorrowMutError(CommonBorrowError::new(slot)))
+        }
     }
 }
 
