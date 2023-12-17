@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     marker::PhantomData,
-    mem::{size_of, MaybeUninit},
+    mem::{self, size_of, MaybeUninit},
     num::NonZeroU32,
     ops::{Deref, DerefMut},
     ptr::NonNull,
@@ -12,7 +12,7 @@ use std::{
 use derive_where::derive_where;
 
 use crate::{
-    token::AcquireExclusiveFor,
+    token::{AcquireExclusiveFor, MainThreadToken, TokenCell},
     util::{cell_u64_ms_i32, cell_u64_ms_u32, PtrExt},
 };
 
@@ -549,14 +549,14 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         u16::MAX.min(Self::MAX_COUNT)
     }
 
-    pub fn dealloc(self, obj: Obj<T>) -> bool {
+    pub fn dealloc(self, obj: Obj<T>) -> Option<T> {
         let inner = unsafe { &mut *self.inner.0.get() };
 
         // Fetch the requested block
         sound_assert!(inner.block_ptrs.len() == inner.block_states.len());
 
         let Some(Some(block_ptr)) = inner.block_ptrs.get(obj.block_idx as usize) else {
-            return false;
+            return None;
         };
         let block_state = unsafe { inner.block_states.get_unchecked_mut(obj.block_idx as usize) };
 
@@ -568,7 +568,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         if slot.state.get() != obj.generation.get() as u64 {
             if slot.state.get() as u32 != obj.generation.get() {
                 // This handle is dead.
-                return false;
+                return None;
             } else {
                 // The object already has concurrent borrows.
                 let state = cell_u64_ms_i32(&slot.state).get();
@@ -582,6 +582,9 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
                 );
             }
         }
+
+        // Take the value out of the slot
+        let value = unsafe { (*slot.value.get()).assume_init_read() };
 
         // Remove the block's backing state if everything is free.
         block_state.alloc_count -= 1;
@@ -623,9 +626,10 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
             inner.hammered = obj.block_idx;
         }
 
-        true
+        Some(value)
     }
 
+    #[inline]
     pub fn is_alive(self, obj: Obj<T>) -> bool {
         let inner = unsafe { &*self.inner.0.get() };
 
@@ -642,6 +646,8 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         slot.state.get() as u32 == obj.generation.get()
     }
 
+    #[inline]
+    #[track_caller]
     pub fn try_get(self, obj: Obj<T>) -> Result<ObjRef<'a, T>, AccessRefError> {
         let inner = unsafe { &*self.inner.0.get() };
 
@@ -678,6 +684,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         })
     }
 
+    #[inline]
     #[track_caller]
     pub fn try_get_mut(self, obj: Obj<T>) -> Result<ObjRefMut<'a, T>, AccessMutError> {
         let inner = unsafe { &*self.inner.0.get() };
@@ -1016,6 +1023,121 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRefMut<'_, T> {
 impl<T: ?Sized + fmt::Display> fmt::Display for ObjRefMut<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
+    }
+}
+
+// === Component === //
+
+pub trait Component: 'static + Sized + Send {
+    type Namespace: Sized;
+
+    fn storage() -> &'static TokenCell<Storage<Self>, Self::Namespace>;
+}
+
+impl<T: Component> Obj<T> {
+    pub fn new(value: T) -> Self {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).alloc(value)
+    }
+
+    pub fn destroy(self) -> Option<T> {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).dealloc(self)
+    }
+
+    #[inline]
+    pub fn is_alive(self) -> bool {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).is_alive(self)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_get(self) -> Result<ObjRef<'static, T>, AccessRefError> {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).try_get(self)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_get_mut(self) -> Result<ObjRefMut<'static, T>, AccessMutError> {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).try_get_mut(self)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn get(self) -> ObjRef<'static, T> {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).get(self)
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn get_mut(self) -> ObjRefMut<'static, T> {
+        let token = MainThreadToken::acquire();
+        T::storage().get_exclusive(token).get_mut(self)
+    }
+}
+
+pub struct OwnedObj<T: Component>(Obj<T>);
+
+impl<T: Component> OwnedObj<T> {
+    pub fn new(value: T) -> Self {
+        Self(Obj::new(value))
+    }
+
+    pub fn destroy(self) -> Option<T> {
+        let destroyed = self.0.destroy();
+        mem::forget(self);
+        destroyed
+    }
+
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_get(&self) -> Result<ObjRef<'static, T>, AccessRefError> {
+        self.0.try_get()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_get_mut(&self) -> Result<ObjRefMut<'static, T>, AccessMutError> {
+        self.0.try_get_mut()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn get(&self) -> ObjRef<'static, T> {
+        self.0.get()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn get_mut(&self) -> ObjRefMut<'static, T> {
+        self.0.get_mut()
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn obj(&self) -> Obj<T> {
+        self.0
+    }
+
+    #[inline]
+    pub fn split_guard(self) -> (OwnedObj<T>, Obj<T>) {
+        let obj = self.obj();
+        (self, obj)
+    }
+}
+
+impl<T: Component> Drop for OwnedObj<T> {
+    fn drop(&mut self) {
+        self.0.destroy();
     }
 }
 
