@@ -297,18 +297,20 @@ struct StorageInner<T> {
 struct BlockState {
     // The index of the previous hammered block or `u16::MAX` if this is the head. If this block is
     // not actively backed by anything, the block is a member of the unbacked linked list instead.
+    // The state of this field is undefined if the block is neither non-free nor unbacked.
     prev_hammered_or_unbacked: u16,
 
     // The index of the next hammered block or `u16::MAX` if there is no next block. If this block is
     // not actively backed by anything, the block is a member of the unbacked linked list instead.
+    // The state of this field is undefined if the block is neither non-free nor unbacked.
     next_hammered_or_unbacked: u16,
 
-    // The byte offset into the block of the first `Slot<T>` instance in the free list. The state
-    // of this field is undefined if there is no linked list head.
+    // The byte offset into the block of the first `Slot<T>` instance in the free list or
+    // `SLOT_SENTINEL` if the block has no free cells.
     free_list_head: u16,
 
     // The number of slots which are currently allocated.
-    non_free_count: u16,
+    alloc_count: u16,
 }
 
 struct Slot<T> {
@@ -321,7 +323,7 @@ struct Slot<T> {
     //   instead of zero.
     // - The last 32 bits indicate the borrow state (as an i32) if the slot is alive, or the
     //   byte-offset of the next allocation in the free list (as a u32) if the slot is zero. If
-    //   there is no next slot in the linked list, this value will be `StorageViewMut::<T>::SLOT_SENTINEL`.
+    //   there is no next slot in the linked list, this value will be `SLOT_SENTINEL`.
     //
     // Borrow state format:
     //
@@ -333,12 +335,22 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-#[derive_where(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+#[derive_where(Copy, Clone, Hash, Eq, PartialEq)]
 pub struct Obj<T> {
     _ty: PhantomData<fn() -> T>,
     block_idx: u16,
     slot_offset: u16,
     generation: NonZeroU32,
+}
+
+impl<T> fmt::Debug for Obj<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Obj")
+            .field("block_idx", &self.block_idx)
+            .field("slot_offset", &self.slot_offset)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 // Lifecycle
@@ -439,11 +451,11 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         // Pop the slot from the free list.
         let next_slot = cell_u64_ms_u32(&slot.state).get() as u16;
         block_state.free_list_head = next_slot;
-        block_state.non_free_count += 1;
+        block_state.alloc_count += 1;
 
-        // If the slot is now empty, move on to the next hammered block.
+        // If the block is now full, move on to the next hammered block.
         if next_slot == Self::SLOT_SENTINEL {
-            // Set the new head of the list
+            // Set the new head of the list.
             inner.hammered = block_state.next_hammered_or_unbacked;
 
             // If that's a real element, set its left reference.
@@ -522,7 +534,7 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
             prev_hammered_or_unbacked: u16::MAX,
             next_hammered_or_unbacked: old_head,
             free_list_head: 0,
-            non_free_count: 0,
+            alloc_count: 0,
         });
         inner.hammered = block_idx;
     }
@@ -537,8 +549,81 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         u16::MAX.min(Self::MAX_COUNT)
     }
 
-    pub fn dealloc(self) {
-        todo!();
+    pub fn dealloc(self, obj: Obj<T>) -> bool {
+        let inner = unsafe { &mut *self.inner.0.get() };
+
+        // Fetch the requested block
+        sound_assert!(inner.block_ptrs.len() == inner.block_states.len());
+
+        let Some(Some(block_ptr)) = inner.block_ptrs.get(obj.block_idx as usize) else {
+            return false;
+        };
+        let block_state = unsafe { inner.block_states.get_unchecked_mut(obj.block_idx as usize) };
+
+        // Fetch the requested slot
+        sound_assert!(Self::is_valid_slot_offset(obj.block_idx, obj.slot_offset));
+        let slot = unsafe { block_ptr.add_addr(obj.slot_offset as usize).as_ref() };
+
+        // Validate generation and borrow state
+        if slot.state.get() != obj.generation.get() as u64 {
+            if slot.state.get() as u32 != obj.generation.get() {
+                // This handle is dead.
+                return false;
+            } else {
+                // The object already has concurrent borrows.
+                let state = cell_u64_ms_i32(&slot.state).get();
+                let state_abs = state.unsigned_abs();
+
+                panic!(
+                    "cannot dealloc {obj:?}: slot is currently borrowed by {} {}{}",
+                    state_abs,
+                    if state < 0 { "writer" } else { "reader" },
+                    if state_abs == 1 { "" } else { "s" }
+                );
+            }
+        }
+
+        // Remove the block's backing state if everything is free.
+        block_state.alloc_count -= 1;
+
+        if block_state.alloc_count == 0 {
+            // TODO
+        }
+
+        // Increment the generation and add the slot to the free element list
+        let became_non_full = block_state.free_list_head == u16::MAX;
+        slot.state.set({
+            let state = slot.state.get();
+            let generation = (state as u32).wrapping_add(1);
+            let next = block_state.free_list_head as u32;
+
+            generation as u64 + ((next as u64) << 32)
+        });
+        block_state.free_list_head = obj.slot_offset;
+
+        // If the block was previously full, add it to the hammer list.
+        if became_non_full {
+            // Update head links
+            block_state.prev_hammered_or_unbacked = u16::MAX;
+            block_state.next_hammered_or_unbacked = inner.hammered;
+
+            // Update old head links
+            if inner.hammered != u16::MAX {
+                sound_assert!((inner.hammered as usize) < inner.block_states.len());
+
+                let old_head_state = unsafe {
+                    inner
+                        .block_states
+                        .get_unchecked_mut(inner.hammered as usize)
+                };
+
+                old_head_state.prev_hammered_or_unbacked = obj.block_idx;
+            }
+
+            inner.hammered = obj.block_idx;
+        }
+
+        true
     }
 
     pub fn is_alive(self, obj: Obj<T>) -> bool {
@@ -1005,7 +1090,7 @@ mod test {
     }
 
     #[test]
-    fn storage_ref_celled_properly() {
+    fn storage_ref_celling() {
         let mut storage = Storage::new();
         let storage = storage.borrow_exclusive_mut();
         let obj = storage.alloc(1);
@@ -1037,6 +1122,42 @@ mod test {
         assert_panics(|| {
             storage.get(obj);
         });
+    }
+
+    #[test]
+    #[should_panic = "slot is currently borrowed by 1 reader"]
+    fn test_illegal_delete() {
+        let mut storage = Storage::new();
+        let storage = storage.borrow_exclusive_mut();
+
+        let target = storage.alloc(1);
+        let _guard = storage.get(target);
+        storage.dealloc(target);
+    }
+
+    #[test]
+    fn fuzz_allocation() {
+        fastrand::seed(4);
+
+        let mut storage = Storage::new();
+        let storage = storage.borrow_exclusive_mut();
+        let mut alive = Vec::new();
+
+        for _ in 0..100_000 {
+            if fastrand::bool() && !alive.is_empty() {
+                let deleted = alive.swap_remove(fastrand::usize(0..alive.len()));
+
+                assert!(storage.is_alive(deleted));
+                storage.dealloc(deleted);
+                assert!(!storage.is_alive(deleted));
+            } else {
+                alive.push(storage.alloc(2));
+            }
+
+            for obj in &alive {
+                assert!(storage.is_alive(*obj));
+            }
+        }
     }
 
     // === Helpers === //
