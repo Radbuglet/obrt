@@ -30,15 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
-name = "autoken"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96aa6849429e318e327803767379c98e405fc0b952789d72340fcc054bd462d7"
-dependencies = [
- "semver",
-]
-
-[[package]]
 name = "beap"
 version = "0.1.0"
 source = "git+https://github.com/Radbuglet/beap.git?rev=e0ac59d480d27e23dd0444c306926fe295b33e66#e0ac59d480d27e23dd0444c306926fe295b33e66"
@@ -331,7 +322,6 @@ dependencies = [
 name = "obrt"
 version = "0.1.0"
 dependencies = [
- "autoken",
  "beap",
  "cfgenius",
  "criterion",
@@ -473,12 +463,6 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
-
-[[package]]
-name = "semver"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "836fa6a3e1e547f9a2c4040802ec865b5d85f4014efe00555d7090a3dcaa1090"
 
 [[package]]
 name = "serde"

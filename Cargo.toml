@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-autoken = "0.1.0"
 cfgenius = "0.1.0"
 derive-where = "1.2.6"
 

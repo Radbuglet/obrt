@@ -6,10 +6,7 @@ use std::{
 };
 
 use criterion::{criterion_main, Criterion};
-use obrt::{
-    storage::{Component, Obj, OwnedObj, Storage},
-    token::{AcquireExclusiveFor, TokenCell},
-};
+use obrt::storage::{Obj, Storage};
 
 criterion_main!(bench);
 
@@ -643,59 +640,6 @@ fn bench() {
 
             while let Some(curr) = cursor {
                 let curr = storage.get_mut(curr);
-                accum += curr.value;
-                cursor = curr.next;
-            }
-
-            accum
-        });
-    });
-
-    c.bench_function("sequential/obrt_global/mut", |c| {
-        #[derive(Default)]
-        struct Item {
-            next: Option<Obj<Self>>,
-            value: u64,
-        }
-
-        impl Component for Item {
-            type Namespace = Item;
-
-            fn storage() -> &'static TokenCell<Storage<Self>, Self::Namespace> {
-                static STORAGE: TokenCell<Storage<Item>, Item> = TokenCell::new(Storage::new());
-                &STORAGE
-            }
-        }
-
-        let head;
-        let mut items = Vec::new();
-        {
-            let (curr_owned, mut curr) = OwnedObj::new(Item {
-                next: None,
-                value: 100,
-            })
-            .split_guard();
-            items.push(curr_owned);
-            head = curr;
-
-            for i in 1..100_000 {
-                let (next_owned, next) = OwnedObj::new(Item {
-                    next: None,
-                    value: i + 100,
-                })
-                .split_guard();
-                items.push(next_owned);
-                curr.get_mut().next = Some(next);
-                curr = next;
-            }
-        }
-
-        c.iter(|| {
-            let mut cursor = Some(head);
-            let mut accum = 0;
-
-            while let Some(curr) = cursor {
-                let curr = curr.get_mut();
                 accum += curr.value;
                 cursor = curr.next;
             }
