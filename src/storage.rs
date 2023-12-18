@@ -317,7 +317,7 @@ struct Slot<T> {
     //
     // - The first 32 bits indicate the generation. When the slot is dead, this is set to the
     //   generation of the next object to take its place. As such, this value is initialized to one
-    //   instead of zero.
+    //   instead of zero. A generation of `0` is never valid.
     // - The last 32 bits indicate the borrow state (as an i32) if the slot is alive, or the
     //   byte-offset of the next allocation in the free list (as a u32) if the slot is zero. If
     //   there is no next slot in the linked list, this value will be `SLOT_SENTINEL`.
@@ -375,7 +375,60 @@ impl<T> Storage<T> {
 
 impl<T> Drop for Storage<T> {
     fn drop(&mut self) {
-        // TODO
+        struct DropAllocationsGuard<'a, T>(&'a mut StorageInner<T>);
+
+        let inner_guard = DropAllocationsGuard(self.0.get_mut());
+        let inner = &mut *inner_guard.0;
+
+        // Drop all values with an allocation
+        for (i, (block, state)) in inner.block_ptrs.iter().zip(&inner.block_states).enumerate() {
+            let Some(block) = block else { continue };
+
+            if state.alloc_count > 0 {
+                // We begin by setting all free node states to zero since `0` is never a valid
+                // generation otherwise.
+                let mut cursor = state.free_list_head;
+
+                while cursor != StorageViewMut::<T>::SLOT_SENTINEL {
+                    let slot = unsafe { block.add_addr(cursor as usize).as_mut() };
+
+                    cursor = cell_u64_ms_u32(&slot.state).get() as u16;
+                    slot.state.set(0);
+                }
+
+                // Now, we can iterate through the block and drop all slots with.
+                let block = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        block.as_ptr(),
+                        StorageViewMut::<T>::block_len(i as u16) as usize,
+                    )
+                };
+
+                for slot in block {
+                    if slot.state.get() != 0 {
+                        unsafe { slot.value.get_mut().assume_init_drop() };
+                    }
+                }
+            }
+        }
+
+        // Drop all block allocations
+        drop(inner_guard);
+
+        impl<T> Drop for DropAllocationsGuard<'_, T> {
+            fn drop(&mut self) {
+                for (i, block) in self.0.block_ptrs.iter().enumerate() {
+                    let Some(block) = block else { continue };
+
+                    drop(unsafe {
+                        Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                            block.as_ptr(),
+                            StorageViewMut::<T>::block_len(i as u16) as usize,
+                        ))
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -593,7 +646,11 @@ impl<'a, T: 'a> StorageViewMut<'a, T> {
         let became_non_full = block_state.free_list_head == u16::MAX;
         slot.state.set({
             let state = slot.state.get();
-            let generation = (state as u32).wrapping_add(1);
+            let mut generation = (state as u32).wrapping_add(1);
+            if generation == 0 {
+                generation = 1;
+            }
+
             let next = block_state.free_list_head as u32;
 
             generation as u64 + ((next as u64) << 32)
@@ -1136,6 +1193,35 @@ mod test {
         let target = storage.alloc(1);
         let _guard = storage.get(target);
         storage.dealloc(target);
+    }
+
+    #[test]
+    fn storage_does_not_leak() {
+        let counter = Cell::new(0);
+
+        struct Inspector<'a>(&'a Cell<u32>);
+
+        impl Drop for Inspector<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let mut storage_guard = Storage::new();
+        let storage = storage_guard.borrow_exclusive_mut();
+
+        let mut objects = (0..100_000)
+            .map(|_| storage.alloc(Inspector(&counter)))
+            .collect::<Vec<_>>();
+
+        fastrand::seed(4);
+        for _ in 0..50_000 {
+            storage.dealloc(objects.swap_remove(fastrand::usize(0..objects.len())));
+        }
+
+        assert_eq!(counter.get(), 50_000);
+        drop(storage_guard);
+        assert_eq!(counter.get(), 100_000);
     }
 
     #[test]
